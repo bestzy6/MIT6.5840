@@ -252,6 +252,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	if rf.state == StateCandidate && rf.currentTerm == args.Term {
+		rf.state = StateFollower
+		DebugPrintf(dInfo, rf.me, "由候选者降级为追随者")
+	}
+
 	// 收到的任期大于自身，则追随该Leader
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
