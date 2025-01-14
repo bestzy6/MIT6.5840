@@ -1,6 +1,9 @@
 package raft
 
-import "log"
+import (
+	"log"
+	"math"
+)
 
 type LogEntry struct {
 	Term    int         //创建该Log时的任期
@@ -44,4 +47,19 @@ func (rf *Raft) GetLog(index int) LogEntry {
 		}
 	}
 	return rf.log[idx-1]
+}
+
+func (rf *Raft) TermRange(term int) (minIdx, maxIdx int) {
+	minIdx, maxIdx = math.MaxInt, -1
+	for i := 0; i < len(rf.log); i++ {
+		if rf.log[i].Term == term {
+			minIdx = min(minIdx, i)
+			maxIdx = max(maxIdx, i)
+		}
+	}
+	if maxIdx == -1 {
+		minIdx = -1
+	}
+	// 大小值均+1，表示索引（索引从1开始）
+	return minIdx + 1, maxIdx + 1
 }

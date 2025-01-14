@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -101,13 +103,28 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	// currentTerm
+	err := e.Encode(rf.currentTerm)
+	if err != nil {
+		DebugPrintf(dError, rf.me, "序列化 rf.currentTerm 失败。err: %s", err.Error())
+	}
+	// votedFor
+	err = e.Encode(rf.votedFor)
+	if err != nil {
+		DebugPrintf(dError, rf.me, "序列化 rf.votedFor 失败。err: %s", err.Error())
+	}
+	// log[]
+	err = e.Encode(rf.log)
+	if err != nil {
+		DebugPrintf(dError, rf.me, "序列化 rf.log 失败。err: %s", err.Error())
+	}
+
+	raftState := w.Bytes()
+	rf.persister.Save(raftState, nil)
+
+	DebugPrintf(dPersist, rf.me, "持久化执行成功")
 }
 
 // restore previously persisted state.
@@ -116,18 +133,25 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	err := d.Decode(&rf.currentTerm)
+	if err != nil {
+		DebugPrintf(dError, rf.me, "反序列化 rf.currentTerm 失败。err: %s", err.Error())
+	}
+
+	err = d.Decode(&rf.votedFor)
+	if err != nil {
+		DebugPrintf(dError, rf.me, "反序列化 rf.votedFor 失败。err: %s", err.Error())
+	}
+
+	err = d.Decode(&rf.log)
+	if err != nil {
+		DebugPrintf(dError, rf.me, "反序列化 rf.log 失败。err: %s", err.Error())
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -175,6 +199,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.state = StateFollower
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
@@ -188,6 +213,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
 		rf.votedFor = args.CandidateId
+		rf.persist()
 		DebugPrintf(dVote, rf.me, "选举候选人 S%d", args.CandidateId)
 		// 重置选举时间
 		rf.resetElectionTime()
@@ -242,6 +268,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	//Extend
+	XTerm  int
+	XIndex int
+	XLen   int
 }
 
 // AppendEntries RPC 发送心跳或者日志提交
@@ -257,6 +287,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DebugPrintf(dTerm, rf.me, "当前任期号：%d", rf.currentTerm)
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		// Extend
+		reply.XTerm = -1 // 不存在
+		reply.XIndex = 0 // 不存在
+		reply.XLen = rf.LastLogIndex()
 		return
 	}
 
@@ -268,6 +302,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 收到的任期大于自身，则追随该Leader
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
+		rf.persist()
 		// 如果是Leader或候选人，则降级为Follower
 		if rf.state == StateLeader || rf.state == StateCandidate {
 			rf.state = StateFollower
@@ -279,6 +314,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex > 0 && args.PrevLogIndex > rf.LastLogIndex() {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		//Extend: Follower的Log过短，并非发生冲突
+		reply.XLen = rf.LastLogIndex()
+		reply.XTerm = -1
+		reply.XIndex = 0
 		DebugPrintf(dInfo, rf.me, "日志Index不一致，收到PrevLogIndex:%d,rf.LastLogIndex=%d", args.PrevLogIndex, rf.LastLogIndex())
 		return
 	}
@@ -286,6 +325,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.LastLogIndex() > 0 && args.PrevLogIndex > 0 && args.PrevLogTerm != rf.GetLog(args.PrevLogIndex).Term {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		// Extend: 冲突信息
+		reply.XTerm = rf.GetLog(args.PrevLogIndex).Term
+		reply.XLen = rf.LastLogIndex()
+		reply.XIndex, _ = rf.TermRange(reply.XTerm)
 		DebugPrintf(dInfo, rf.me, "日志Term不一致，收到的PrevLogTerm: %d,MyPrevLogTerm: %d", args.PrevLogTerm, rf.GetLog(args.PrevLogIndex).Term)
 		return
 	}
@@ -294,6 +337,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 第二个判断条件是截断未提交的过期数据
 		if rf.LastLogIndex() < args.PrevLogIndex+i+1 || rf.GetLog(args.PrevLogIndex+i+1).Term != entry.Term {
 			rf.log = append(rf.GetLogSlice(1, args.PrevLogIndex+i+1), args.Entries[i:]...)
+			rf.persist()
 			break
 		}
 	}
@@ -371,6 +415,7 @@ func (rf *Raft) sendEntry2Server(server int, args AppendEntriesArgs) {
 			rf.state = StateFollower
 		}
 		rf.currentTerm = reply.Term
+		rf.persist()
 		rf.resetElectionTime()
 		return
 	}
@@ -418,8 +463,26 @@ func (rf *Raft) sendEntry2Server(server int, args AppendEntriesArgs) {
 		DebugPrintf(dLeader, rf.me, "S%d拒绝AppendEntry", server)
 
 		// 减少nextIdx，然后重试
-		if rf.nextIndex[server] > 1 {
-			rf.nextIndex[server]--
+		//if rf.nextIndex[server] > 1 {
+		//	rf.nextIndex[server]--
+		//}
+
+		// extend
+		if reply.XTerm == -1 {
+			rf.nextIndex[server] = reply.XLen + 1
+			DebugPrintf(dLog, rf.me, "S%d XTerm == -1,nextIdx -> reply.XLen + 1", server)
+		} else {
+			_, maxIdx := rf.TermRange(reply.XTerm)
+			if maxIdx == 0 {
+				rf.nextIndex[server] = reply.XIndex
+				DebugPrintf(dLog, rf.me, "Leader no XTerm%d ,S%d nextIdx -> %d", reply.XTerm, server, reply.XIndex)
+			} else {
+				rf.nextIndex[server] = maxIdx
+				DebugPrintf(dLog, rf.me, "Leader has XTerm%d ,S%d nextIdx -> %d", reply.XTerm, server, maxIdx)
+			}
+		}
+		if len(rf.log) < rf.nextIndex[server] {
+			return
 		}
 
 		nextIdx := rf.nextIndex[server]
@@ -452,6 +515,7 @@ func (rf *Raft) raiseElection() {
 	rf.votedFor = rf.me
 	rf.state = StateCandidate
 	rf.currentTerm++
+	rf.persist()
 
 	// 升级为Candidate之后，需要更新MatchIndex、NextIndex
 	for k := range rf.nextIndex {
@@ -582,6 +646,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 		Command: command,
 	})
+	rf.persist()
 
 	term = rf.currentTerm
 	index = rf.LastLogIndex() // 日志索引从1开始
