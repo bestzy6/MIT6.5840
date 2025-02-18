@@ -1,13 +1,23 @@
 package kvraft
 
-import "6.5840/labrpc"
+import (
+	"6.5840/labrpc"
+	"sync/atomic"
+	"time"
+)
 import "crypto/rand"
 import "math/big"
-
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	clerkId    int64
+	nextReqId  int64
+	lastLeader int64
+}
+
+func (ck *Clerk) nextId() int64 {
+	return atomic.AddInt64(&ck.nextReqId, 1)
 }
 
 func nrand() int64 {
@@ -21,6 +31,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clerkId = nrand()
 	return ck
 }
 
@@ -37,7 +48,37 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	args := GetArgs{
+		Key:     key,
+		ClerkID: ck.clerkId,
+		ReqID:   ck.nextId(),
+	}
+	var reply GetReply
+
+	serverId := int(atomic.LoadInt64(&ck.lastLeader))
+	for {
+		ok := ck.servers[serverId].Call("KVServer.Get", &args, &reply)
+		if !ok {
+			// 该Server可能已经宕机，尝试下一个
+			serverId = (serverId + 1) % len(ck.servers)
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		switch reply.Err {
+		case OK:
+			DPrintf("[Client] Get key From Server%d:[%s] success, val:[%s]", serverId, key, reply.Value)
+			atomic.SwapInt64(&ck.lastLeader, int64(serverId))
+			return reply.Value
+		case ErrNoKey:
+			return ""
+		case ErrWrongLeader:
+			DPrintf("[Client] Server %d is not Leader", serverId)
+			serverId = (serverId + 1) % len(ck.servers)
+		case ErrTimeout:
+			DPrintf("[Client] Server %d is Timeout", serverId)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // shared by Put and Append.
@@ -50,6 +91,38 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{
+		Key:     key,
+		Value:   value,
+		ClerkID: ck.clerkId,
+		ReqID:   ck.nextId(),
+	}
+	var reply PutAppendReply
+
+	serverId := int(atomic.LoadInt64(&ck.lastLeader))
+
+	for {
+		DPrintf("[Client] Ready to %s key:[%s] value:[%s] to S%d", op, key, value, serverId)
+		ok := ck.servers[serverId].Call("KVServer."+op, &args, &reply)
+		if !ok {
+			// 该Server可能已经宕机，尝试下一个
+			serverId = (serverId + 1) % len(ck.servers)
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		switch reply.Err {
+		case OK:
+			DPrintf("[Client] %s key:[%s] To S%d success", op, key, serverId)
+			atomic.SwapInt64(&ck.lastLeader, int64(serverId))
+			return
+		case ErrWrongLeader:
+			DPrintf("[Client] %s ,But Server %d is not Leader", op, serverId)
+			serverId = (serverId + 1) % len(ck.servers)
+		case ErrTimeout:
+			DPrintf("[Client] %s ,Server %d is Timeout", op, serverId)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
