@@ -4,6 +4,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -120,6 +121,9 @@ type KVServer struct {
 	db       *Database
 	notifyCh *NotifyCh
 	applied  *AppliedLog
+
+	lastApplied int
+	persister   *raft.Persister
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -241,6 +245,7 @@ func (kv *KVServer) handleOperation() {
 			}
 			ch := kv.notifyCh.Get(op.ClerkID, op.ReqId)
 			if err == OK {
+				kv.lastApplied = msg.CommandIndex //4B
 				kv.applied.Put(op.ClerkID, op.ReqId, val)
 			}
 			kv.mu.Unlock()
@@ -255,8 +260,76 @@ func (kv *KVServer) handleOperation() {
 					kv.me, op.ClerkID, op.ReqId, op.Type, op.Key, op.Value)
 				close(ch)
 			}
+
+			// 判断是否需要生成快照
+			size := kv.persister.RaftStateSize()
+			if kv.maxraftstate != -1 && size >= int(float64(kv.maxraftstate)*0.9) {
+				DPrintf("[Server%d] RaftStateSize:[%d] >= MaxRaftState:[%d], Start GenSnapShot", kv.me, size, kv.maxraftstate)
+				kv.mu.Lock()
+				data := kv.GenSnapShot()
+				kv.rf.Snapshot(msg.CommandIndex, data)
+				kv.mu.Unlock()
+			}
+		} else if msg.SnapshotValid {
+			DPrintf("[Server%d] Raft Apply Snapshot, Index:[%d]", kv.me, msg.SnapshotIndex)
+			kv.mu.Lock()
+			if msg.SnapshotIndex >= kv.lastApplied {
+				kv.LoadSnapShot(msg.Snapshot)
+				kv.lastApplied = msg.SnapshotIndex
+			}
+			kv.mu.Unlock()
 		}
 	}
+}
+
+func (kv *KVServer) GenSnapShot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if err := e.Encode(kv.db); err != nil {
+		DPrintf("[Server%d] GenSnapShot Encode DB Failed, Err: %v", kv.me, err)
+		return nil
+	}
+	if err := e.Encode(kv.applied); err != nil {
+		DPrintf("[Server%d] GenSnapShot Encode Applied Failed, Err: %v", kv.me, err)
+		return nil
+	}
+	if err := e.Encode(kv.lastApplied); err != nil {
+		DPrintf("[Server%d] GenSnapShot Encode LastApplied Failed, Err: %v", kv.me, err)
+		return nil
+	}
+	data := w.Bytes()
+	return data
+}
+
+func (kv *KVServer) LoadSnapShot(snapShot []byte) {
+	if len(snapShot) == 0 {
+		return
+	}
+	r := bytes.NewBuffer(snapShot)
+	d := labgob.NewDecoder(r)
+
+	var (
+		db          Database
+		applied     AppliedLog
+		lastApplied int
+	)
+
+	if err := d.Decode(&db); err != nil {
+		DPrintf("[Server%d] LoadSnapShot Decode DB Failed, Err: %v", kv.me, err)
+		return
+	}
+	if err := d.Decode(&applied); err != nil {
+		DPrintf("[Server%d] LoadSnapShot Decode Applied Failed, Err: %v", kv.me, err)
+		return
+	}
+	if err := d.Decode(&lastApplied); err != nil {
+		DPrintf("[Server%d] LoadSnapShot Decode LastApplied Failed, Err: %v", kv.me, err)
+		return
+	}
+
+	kv.db = &db
+	kv.applied = &applied
+	kv.lastApplied = lastApplied
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -309,6 +382,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.db = NewDatabase(kv.me)
 	kv.notifyCh = &NotifyCh{}
 	kv.applied = &AppliedLog{}
+	kv.persister = persister
+	kv.LoadSnapShot(persister.ReadSnapshot())
 	go kv.handleOperation()
 
 	return kv
