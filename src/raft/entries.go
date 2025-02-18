@@ -19,13 +19,15 @@ func (rf *Raft) GetLogSlice(left, right int) []LogEntry {
 		panic("数组越界")
 	}
 
+	left, right = left-rf.LastIncludedIndex, right-rf.LastIncludedIndex
+
 	newLog := make([]LogEntry, right-left)
 	copy(newLog, rf.log[left-1:right-1])
 	return newLog
 }
 
 func (rf *Raft) LastLogIndex() int {
-	idx := len(rf.log)
+	idx := len(rf.log) + rf.LastIncludedIndex
 	return idx
 }
 
@@ -35,9 +37,15 @@ func (rf *Raft) LastLogTerm() int {
 }
 
 func (rf *Raft) GetLog(index int) LogEntry {
-	idx := index
+	idx := index - rf.LastIncludedIndex
 	if idx < 0 {
 		log.Panicf("idx:%d < 0", idx)
+	}
+	if idx == 0 {
+		return LogEntry{
+			Term:    rf.LastIncludedTerm,
+			Command: nil,
+		}
 	}
 
 	if idx > len(rf.log) {
@@ -50,9 +58,12 @@ func (rf *Raft) GetLog(index int) LogEntry {
 }
 
 func (rf *Raft) TermRange(term int) (minIdx, maxIdx int) {
+	if term == 0 {
+		return 0, 0
+	}
 	minIdx, maxIdx = math.MaxInt, -1
-	for i := 0; i < len(rf.log); i++ {
-		if rf.log[i].Term == term {
+	for i := rf.LastIncludedIndex + 1; i <= rf.LastLogIndex(); i++ {
+		if rf.GetLog(i).Term == term {
 			minIdx = min(minIdx, i)
 			maxIdx = max(maxIdx, i)
 		}
