@@ -18,6 +18,7 @@ const (
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrTimeout     = "ErrTimeOut"
 	ErrWrongConfigNum
+	ErrUpdateConfig = "ErrUpdateConfig"
 )
 
 const (
@@ -25,7 +26,17 @@ const (
 	OpTypePut    = "PUT"
 	OpTypeAppend = "APPEND"
 
-	OpTypeConfig = "CONFIG"
+	OpTypeConfig      = "CONFIG"
+	OpTypeAddShard    = "ADD_SHARD"
+	OpTypeRemoveShard = "REMOVE_SHARD"
+)
+
+type ShardStatus uint8
+
+const (
+	ShardStatusServing   ShardStatus = iota // 正在提供服务
+	ShardStatusSending               = iota // 正在发送
+	ShardStatusReceiving             = iota // 正在接收
 )
 
 type Err string
@@ -59,11 +70,16 @@ type GetReply struct {
 	Value string
 }
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
 		log.Printf(format, a...)
 	}
 	return
+}
+
+type KV struct {
+	Key   string
+	Value string
 }

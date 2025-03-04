@@ -15,12 +15,16 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Type    string
-	Key     string // OpTypeGet, OpTypePut, OpTypeAppend
-	Value   string // OpTypeGet, OpTypePut, OpTypeAppend
-	ClerkID int64
-	ReqId   int64
-	Config  shardctrler.Config // OpTypeConfig
+	Type       string
+	Key        string // OpTypeGet, OpTypePut, OpTypeAppend
+	Value      string // OpTypeGet, OpTypePut, OpTypeAppend
+	ClerkID    int64
+	ReqId      int64
+	Config     shardctrler.Config // OpTypeConfig
+	Shard      int                // OpTypeAddShard, OpTypeRemoveShard
+	ShardData  []KV               // OpTypeAddShard
+	ConfigNum  int                // OpTypeAddShard, OpTypeRemoveShard
+	AppliedLog AppliedLog         // OpTypeAddShard
 }
 
 type ShardKV struct {
@@ -41,8 +45,10 @@ type ShardKV struct {
 	lastApplied int
 	persister   *raft.Persister
 
-	mck    *shardctrler.Clerk
-	config shardctrler.Config
+	mck          *shardctrler.Clerk
+	config       shardctrler.Config
+	preConfig    shardctrler.Config
+	ShardsStatus [shardctrler.NShards]ShardStatus
 
 	ClerkId   int64
 	NextReqId int64
@@ -112,7 +118,7 @@ func (kv *ShardKV) opHandler(op Op) (string, Err) {
 			kv.mu.Unlock()
 			return "", ErrWrongLeader
 		}
-		if kv.config.Shards[shard] != kv.gid {
+		if kv.config.Shards[shard] != kv.gid || kv.ShardsStatus[shard] != ShardStatusServing {
 			DPrintf("[Server%d-%d] Handle Key[%s] Shard[%v] Failed, config: %v", kv.gid, kv.me, op.Key, shard, kv.config)
 			kv.mu.Unlock()
 			return "", ErrWrongGroup
@@ -201,6 +207,10 @@ func (kv *ShardKV) handleOperation() {
 				val, err = kv.db.Append(op.Key, op.Value)
 			case OpTypeConfig:
 				err = kv.UpdateConfig(op.Config)
+			case OpTypeAddShard:
+				err = kv.AddShard(op.Shard, op.ShardData, op.ConfigNum, op.AppliedLog)
+			case OpTypeRemoveShard:
+				err = kv.RemoveShard(op.Shard, op.ConfigNum)
 			}
 			ch := kv.notifyCh.Get(op.ClerkID, op.ReqId)
 			if err == OK {
@@ -244,6 +254,55 @@ func (kv *ShardKV) handleOperation() {
 	}
 }
 
+func (kv *ShardKV) AddShard(shard int, shardData []KV, cfgNum int, appliedLog AppliedLog) Err {
+	if cfgNum != kv.config.Num {
+		return ErrWrongConfigNum
+	}
+	// 写入数据库
+	for i := range shardData {
+		kv.db.Put(shardData[i].Key, shardData[i].Value)
+	}
+	kv.applied.Merge(appliedLog)
+	DPrintf("[Server%d-%d] Put data Success, Shard:[%d]", kv.gid, kv.me, shard)
+	// 更新状态
+	kv.ShardsStatus[shard] = ShardStatusServing
+	DPrintf("[Server%d-%d] Update Status Success, Shard:[%d], Status:[%v]", kv.gid, kv.me, shard, kv.ShardsStatus)
+	return OK
+}
+
+func (kv *ShardKV) RemoveShard(shard int, cfgNum int) Err {
+	if cfgNum != kv.config.Num {
+		return ErrWrongConfigNum
+	}
+	// 删除数据库
+	kv.db.DeleteByShard(shard)
+	DPrintf("[Server%d-%d] Delete data Success, Shard:[%d]", kv.gid, kv.me, shard)
+	// 更新状态
+	kv.ShardsStatus[shard] = ShardStatusServing
+	DPrintf("[Server%d-%d] Update Status Success, Shard:[%d], Status:[%v]", kv.gid, kv.me, shard, kv.ShardsStatus)
+	return OK
+}
+
+func (kv *ShardKV) DiffShards(new shardctrler.Config) []int {
+	var shards []int
+	for i := 0; i < shardctrler.NShards; i++ {
+		if kv.config.Shards[i] != 0 && kv.config.Shards[i] != new.Shards[i] {
+			shards = append(shards, i)
+		}
+	}
+	return shards
+}
+
+// 如果所有Shard都处于Serving状态，则允许更新
+func (kv *ShardKV) allowToUpdateConfig() bool {
+	for _, status := range kv.ShardsStatus {
+		if status != ShardStatusServing {
+			return false
+		}
+	}
+	return true
+}
+
 func (kv *ShardKV) UpdateConfig(newCfg shardctrler.Config) Err {
 	if kv.config.Num >= newCfg.Num {
 		DPrintf("[Server%d-%d] Config Num[%d] >= New Config Num[%d], Do not need to Update", kv.gid, kv.me, kv.config.Num, newCfg.Num)
@@ -257,8 +316,36 @@ func (kv *ShardKV) UpdateConfig(newCfg shardctrler.Config) Err {
 		kv.config = newCfg
 		return OK
 	}
+
+	// 判断是否更新
+	if !kv.allowToUpdateConfig() {
+		DPrintf("[Server%d-%d] Can't Update Config, Shards Not Serving, Shard Status: %v", kv.gid, kv.me, kv.ShardsStatus)
+		return ErrUpdateConfig
+	}
+
+	diffShards := kv.DiffShards(newCfg)
+	// 如果Shards不存在差别
+	if len(diffShards) == 0 {
+		kv.preConfig = kv.config
+		kv.config = newCfg
+		DPrintf("[Server%d-%d] No Diff, Apply Config, Update Num:[%d]", kv.gid, kv.me, newCfg.Num)
+		return OK
+	}
+
+	// 已确保"差异Shard"处于服务状态，可以更新配置
+	for _, shard := range diffShards {
+		// 待发送的Shard
+		if kv.config.Shards[shard] == kv.gid && newCfg.Shards[shard] != kv.gid {
+			kv.ShardsStatus[shard] = ShardStatusSending
+		}
+		// 待接受的Shard
+		if kv.config.Shards[shard] != kv.gid && newCfg.Shards[shard] == kv.gid {
+			kv.ShardsStatus[shard] = ShardStatusReceiving
+		}
+	}
+	kv.preConfig = kv.config
 	kv.config = newCfg
-	DPrintf("[Server%d-%d] Update Config Success:[%v]", kv.gid, kv.me, newCfg)
+	DPrintf("[Server%d-%d] Update Config Success:[%v], Current Status:[%v]", kv.gid, kv.me, newCfg, kv.ShardsStatus)
 	return OK
 }
 
@@ -281,6 +368,22 @@ func (kv *ShardKV) GenSnapShot() []byte {
 		DPrintf("[Server%d-%d] GenSnapShot Encode Config Failed, Err: %v", kv.gid, kv.me, err)
 		return nil
 	}
+	if err := e.Encode(kv.preConfig); err != nil {
+		DPrintf("[Server%d-%d] GenSnapShot Encode PreConfig Failed, Err: %v", kv.gid, kv.me, err)
+		return nil
+	}
+	if err := e.Encode(kv.ShardsStatus); err != nil {
+		DPrintf("[Server%d-%d] GenSnapShot Encode ShardsStatus Failed, Err: %v", kv.gid, kv.me, err)
+		return nil
+	}
+	if err := e.Encode(kv.ClerkId); err != nil {
+		DPrintf("[Server%d-%d] GenSnapShot Encode ClerkId Failed, Err: %v", kv.gid, kv.me, err)
+		return nil
+	}
+	if err := e.Encode(kv.NextReqId); err != nil {
+		DPrintf("[Server%d-%d] GenSnapShot Encode NextReqId Failed, Err: %v", kv.gid, kv.me, err)
+		return nil
+	}
 
 	data := w.Bytes()
 	return data
@@ -298,6 +401,10 @@ func (kv *ShardKV) LoadSnapShot(snapShot []byte) {
 		applied     AppliedLog
 		lastApplied int
 		cfg         shardctrler.Config
+		preCfg      shardctrler.Config
+		status      [shardctrler.NShards]ShardStatus
+		clerkId     int64
+		nextReqId   int64
 	)
 
 	if err := d.Decode(&db); err != nil {
@@ -316,11 +423,31 @@ func (kv *ShardKV) LoadSnapShot(snapShot []byte) {
 		DPrintf("[Server%d-%d] LoadSnapShot Decode Config Failed, Err: %v", kv.gid, kv.me, err)
 		return
 	}
+	if err := d.Decode(&preCfg); err != nil {
+		DPrintf("[Server%d-%d] LoadSnapShot Decode PreConfig Failed, Err: %v", kv.gid, kv.me, err)
+		return
+	}
+	if err := d.Decode(&status); err != nil {
+		DPrintf("[Server%d-%d] LoadSnapShot Decode ShardsStatus Failed, Err: %v", kv.gid, kv.me, err)
+		return
+	}
+	if err := d.Decode(&clerkId); err != nil {
+		DPrintf("[Server%d-%d] LoadSnapShot Decode ClerkId Failed, Err: %v", kv.gid, kv.me, err)
+		return
+	}
+	if err := d.Decode(&nextReqId); err != nil {
+		DPrintf("[Server%d-%d] LoadSnapShot Decode NextReqId Failed, Err: %v", kv.gid, kv.me, err)
+		return
+	}
 
 	kv.db = &db
 	kv.applied = &applied
 	kv.lastApplied = lastApplied
 	kv.config = cfg
+	kv.preConfig = preCfg
+	kv.ShardsStatus = status
+	kv.ClerkId = clerkId
+	kv.NextReqId = nextReqId
 }
 
 func (kv *ShardKV) isLeader() bool {
@@ -355,6 +482,30 @@ func (kv *ShardKV) PollConfig() {
 				}
 			}
 		}
+	}
+}
+
+func (kv *ShardKV) ShardWatcher() {
+	for !kv.killed() {
+		time.Sleep(50 * time.Millisecond)
+		if !kv.isLeader() {
+			continue
+		}
+
+		kv.mu.Lock()
+		if kv.config.Num == 0 {
+			kv.mu.Unlock()
+			continue
+		}
+
+		for shard, status := range kv.ShardsStatus {
+			if status == ShardStatusSending {
+				DPrintf("[Server%d-%d] ShardWatcher is Preparing to Send Shard", kv.gid, kv.me)
+				kv.NextReqId++
+				go kv.SendShard(shard, kv.config.Num, kv.applied.Copy(), kv.NextReqId)
+			}
+		}
+		kv.mu.Unlock()
 	}
 }
 
@@ -429,6 +580,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	go kv.handleOperation()
 	go kv.PollConfig()
+	go kv.ShardWatcher()
 	DPrintf("[Server%d-%d] Start Success", kv.gid, kv.me)
 	return kv
 }

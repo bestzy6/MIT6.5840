@@ -32,3 +32,25 @@ func (a *AppliedLog) Get(clerkId, reqId int64) (string, bool) {
 	}
 	return "", false
 }
+
+func (a *AppliedLog) Merge(other AppliedLog) {
+	if a.Applied == nil {
+		a.Applied = make(map[int64]AppliedMsg)
+	}
+	for k, v := range other.Applied {
+		if a.Applied[k].ReqId < v.ReqId {
+			a.Applied[k] = v
+		}
+	}
+}
+
+func (a *AppliedLog) Copy() AppliedLog {
+	if a.Applied == nil {
+		return AppliedLog{}
+	}
+	applied := make(map[int64]AppliedMsg, len(a.Applied))
+	for k, v := range a.Applied {
+		applied[k] = v
+	}
+	return AppliedLog{Applied: applied}
+}
