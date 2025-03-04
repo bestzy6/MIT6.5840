@@ -12,6 +12,6 @@
 - [x] Lab4 : Fault-tolerant Key/Value Service
   - [x] Lab4A ![Moderate](https://placehold.co/15x15/1589F0/1589F0.png): Key/value service without snapshots
   - [x] Lab4B ![hard](https://placehold.co/15x15/f03c15/f03c15.png): Key/value service with snapshots
-- [ ] Lab5 : Sharded Key/Value Service
-  - [ ] Lab5A ![easy](https://placehold.co/15x15/c5f015/c5f015.png): The Controller and Static Sharding
-  - [ ] Lab55 ![hard](https://placehold.co/15x15/f03c15/f03c15.png): Shard Movement
+- [x] Lab5 : Sharded Key/Value Service
+  - [x] Lab5A ![easy](https://placehold.co/15x15/c5f015/c5f015.png): The Controller and Static Sharding
+  - [x] Lab55 ![hard](https://placehold.co/15x15/f03c15/f03c15.png): Shard Movement
