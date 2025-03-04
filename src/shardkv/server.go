@@ -413,6 +413,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.ctrlers = ctrlers
 
 	// Your initialization code here.
+	kv.ClerkId = nrand()
 	kv.db = NewDatabase(kv.gid, kv.me)
 	kv.notifyCh = &NotifyCh{}
 	kv.applied = &AppliedLog{}
