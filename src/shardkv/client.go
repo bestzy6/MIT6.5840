@@ -8,7 +8,10 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "6.5840/labrpc"
+import (
+	"6.5840/labrpc"
+	"sync/atomic"
+)
 import "crypto/rand"
 import "math/big"
 import "6.5840/shardctrler"
@@ -38,6 +41,12 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	clerkId   int64
+	nextReqId int64
+}
+
+func (ck *Clerk) nextId() int64 {
+	return atomic.AddInt64(&ck.nextReqId, 1)
 }
 
 // the tester calls MakeClerk.
@@ -52,6 +61,7 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.clerkId = nrand()
 	return ck
 }
 
@@ -62,6 +72,8 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
+	args.ClerkID = ck.clerkId
+	args.ReqID = ck.nextId()
 
 	for {
 		shard := key2shard(key)
@@ -96,7 +108,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
-
+	args.ClerkID = ck.clerkId
+	args.ReqID = ck.nextId()
 
 	for {
 		shard := key2shard(key)
