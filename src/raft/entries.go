@@ -71,6 +71,5 @@ func (rf *Raft) TermRange(term int) (minIdx, maxIdx int) {
 	if maxIdx == -1 {
 		minIdx = -1
 	}
-	// 大小值均+1，表示索引（索引从1开始）
-	return minIdx + 1, maxIdx + 1
+	return minIdx, maxIdx
 }
